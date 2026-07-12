@@ -232,14 +232,6 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     ggml_build_forward_expand(gf, cur);
 }
 
-// utility to get one slice from the third dimension
-// input dim:  [x, y, c, b]
-// output dim: [x, y, 1, b]
-static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t c) {
-    return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], 1, t->ne[3],
-        t->nb[1], t->nb[2], t->nb[3], t->nb[2] * c);
-}
-
 ggml_tensor * llama_model_qwen3next::graph::build_norm_gated(
         ggml_tensor * input,
         ggml_tensor * weights,
@@ -319,8 +311,6 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
 
     gate = ggml_sigmoid(ctx0, gate);
     cb(gate, "gate_sigmoid", il);
-
-    gate = ggml_reshape_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
 
     cur = ggml_mul(ctx0, cur, gate);
     cb(cur, "attn_gated", il);
@@ -722,14 +712,6 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
     Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "mtp_Qcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
-            n_embd_head, n_head, n_tokens,
-            ggml_element_size(Qcur_full) * n_embd_head * 2,
-            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-            ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
-
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -737,7 +719,6 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
 
     Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -745,6 +726,10 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
     Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+    
+    cb(Qcur, "mtp_Qcur", il);
+    cb(Kcur, "mtp_Kcur", il);
+    cb(Vcur, "mtp_Vcur", il);
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
@@ -754,9 +739,27 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "mtp_attn_pregate", il);
 
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full,
+            n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+
+    // TODO: CUDA is missing non-contiguous unary ops. when implemented: remove this cont
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    cb(gate, "mtp_gate", il);
+
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
+
+    // Prune to the output rows before the residual + MoE FFN: the catch-up decode
+    // (KV fill, no outputs) only needs the K/V written above, and the masked h_nextn
+    // extraction expects t_h_nextn to contain exactly the output rows.
+    if (inp_out_ids) {
+        cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
+        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+    }
 
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
@@ -817,9 +820,6 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
-
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
