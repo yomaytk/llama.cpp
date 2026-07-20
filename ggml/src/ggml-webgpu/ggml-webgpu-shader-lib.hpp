@@ -118,6 +118,11 @@ struct ggml_webgpu_binary_shader_decisions {
     bool     src_overlap = false;
 };
 
+struct ggml_webgpu_glu_shader_decisions {
+    uint32_t wg_size     = 0;
+    bool     src_overlap = false;
+};
+
 struct ggml_webgpu_processed_shader {
     std::string           wgsl;
     std::string           variant;
@@ -1066,9 +1071,10 @@ struct ggml_webgpu_glu_pipeline_key {
     ggml_glu_op glu_op;
     ggml_type   type;
     bool        split;
+    bool        src_overlap;
 
     bool operator==(const ggml_webgpu_glu_pipeline_key & other) const {
-        return glu_op == other.glu_op && type == other.type && split == other.split;
+        return glu_op == other.glu_op && type == other.type && split == other.split && src_overlap == other.src_overlap;
     }
 };
 
@@ -1078,6 +1084,7 @@ struct ggml_webgpu_glu_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.glu_op);
         ggml_webgpu_hash_combine(seed, key.type);
         ggml_webgpu_hash_combine(seed, key.split);
+        ggml_webgpu_hash_combine(seed, key.src_overlap);
         return seed;
     }
 };
@@ -2989,6 +2996,7 @@ class ggml_webgpu_shader_lib {
         key.glu_op                       = ggml_get_glu_op(context.dst);
         key.type                         = context.dst->type;
         key.split                        = (context.src1 != nullptr);
+        key.src_overlap                  = key.split && ggml_webgpu_tensor_overlap(context.src0, context.src1);
 
         auto it = glu_pipelines.find(key);
         if (it != glu_pipelines.end()) {
@@ -3039,7 +3047,10 @@ class ggml_webgpu_shader_lib {
                 GGML_ABORT("Unsupported type for GLU shader");
         }
 
-        if (key.split) {
+        if (key.src_overlap) {
+            defines.push_back("SRC_OVERLAP");
+            variant += "_src_overlap";
+        } else if (key.split) {
             variant += "_split";
         } else {
             defines.push_back("NO_SPLIT");
@@ -3048,8 +3059,9 @@ class ggml_webgpu_shader_lib {
         defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
 
         auto processed           = preprocessor.preprocess(wgsl_glu, defines);
-        auto decisions           = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        auto decisions           = std::make_shared<ggml_webgpu_glu_shader_decisions>();
         decisions->wg_size       = context.max_wg_size;
+        decisions->src_overlap   = key.src_overlap;
         webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context         = decisions;
         glu_pipelines[key]       = pipeline;
