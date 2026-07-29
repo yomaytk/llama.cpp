@@ -65,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-b/--backend backend] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -482,7 +482,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const char * backend_filter) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -519,6 +519,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             const size_t device_count = ggml_backend_dev_count();
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (backend_filter != nullptr && strcmp(backend_filter, ggml_backend_dev_name(dev)) != 0) {
+                    continue;
+                }
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
@@ -529,7 +532,17 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
 
-        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        if (backend_filter == nullptr) {
+            dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        } else if (dev_configs.empty()) {
+            LOG_ERR("%s: no device found matching backend name: %s\n", __func__, backend_filter);
+            LOG_ERR("%s: available devices:\n", __func__);
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                LOG_ERR("%s:   %s\n", __func__, ggml_backend_dev_name(ggml_backend_dev_get(i)));
+            }
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+            return 1;
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -650,6 +663,7 @@ int main(int argc, char ** argv) {
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
+    const char * backend_filter = nullptr;
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
@@ -663,6 +677,14 @@ int main(int argc, char ** argv) {
                     LOG_ERR("%s: unkown LLM architecture: %s\n", __func__, arch_name.c_str());
                     return 1;
                 }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 < argc) {
+                backend_filter = argv[++i];
             } else {
                 usage(argv);
                 return 1;
@@ -695,7 +717,7 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
-        return test_backends(arch, seed, log_level);
+        return test_backends(arch, seed, log_level, backend_filter);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
