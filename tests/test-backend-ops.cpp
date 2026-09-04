@@ -9072,7 +9072,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 2, 1, 1}, view));
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 2, 1}, view));
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 2}, view));
+        test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {2, 2, 2, 2}, view));
     }
+    // long reductions into a small dst (norm weight gradients), where backends switch to a cooperative reduce
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {1024, 1, 1, 1}, {1, 256, 1, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 16, 100, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {6, 1, 1, 1}, {1, 3, 7, 1}));
 
     test_cases.emplace_back(new test_dup(GGML_TYPE_F32));
     test_cases.emplace_back(new test_dup(GGML_TYPE_F16));
@@ -9724,6 +9729,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
+
+    // shapes that do not line up with tile sizes in any dim, and a reduction longer than one tile
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 100, 37, 50, {2, 1}, {1, 2}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1000, 20, 300, {1, 1}, {1, 1}, true));
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
@@ -10476,6 +10485,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // TEMP-PERF-BEGIN (measurement only, remove before commit)
+    // repeat_back: norm weight gradients (single dst row, repeats = tokens)
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {1024, 1, 1, 1}, {1, 256, 1, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {1024, 1, 1, 1}, {1, 2048, 1, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 16, 256, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {128, 1, 1, 1}, {1, 16, 2048, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {1024, 256, 1, 1}, {1, 1, 1, 1}));
+    test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {1024, 256, 1, 1}, {1, 1, 8, 1}));
+    // out_prod: weight gradients dst [n_in, n_out], K = tokens
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1024, 256,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 3072, 256,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1024, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 8192, 256,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1024, 256,  {1, 1}, {1, 1}, true));
+    // get_rows_back: embedding gradients dst [n_embd, n_vocab], n_idx = tokens
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1024, 4096,   256, 1, false));
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1024, 32000,  256, 1, false));
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1024, 151936, 256, 1, false));
+    // TEMP-PERF-END
+
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
