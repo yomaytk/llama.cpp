@@ -204,6 +204,20 @@ struct ggml_webgpu_set_rows_shader_decisions {
 
 /** Set **/
 
+// tiling of the backward kernels, shared by the shader defines and the host dispatch
+static constexpr uint32_t GGML_WEBGPU_OUT_PROD_TM      = 64;  // dst ne0 per workgroup
+static constexpr uint32_t GGML_WEBGPU_OUT_PROD_TN      = 64;  // dst ne1 per workgroup
+static constexpr uint32_t GGML_WEBGPU_OUT_PROD_TK      = 16;  // reduction chunk staged in shared memory
+// each thread owns a 4x4 micro tile
+static constexpr uint32_t GGML_WEBGPU_OUT_PROD_WG_SIZE = (GGML_WEBGPU_OUT_PROD_TM / 4) * (GGML_WEBGPU_OUT_PROD_TN / 4);
+
+static constexpr uint32_t GGML_WEBGPU_GET_ROWS_BACK_WG_SIZE = 256;
+
+static constexpr uint32_t GGML_WEBGPU_REPEAT_BACK_WG_SIZE = 256;  // REDUCE variant, TX * TY
+static constexpr uint32_t GGML_WEBGPU_REPEAT_BACK_TX_MAX  = 16;   // consecutive dst elements per workgroup
+static constexpr uint32_t GGML_WEBGPU_REPEAT_BACK_MIN_REP = 16;   // repeats per dst element to switch to REDUCE
+static constexpr uint32_t GGML_WEBGPU_REPEAT_BACK_MIN_WG  = 64;   // shrink TX until at least this many workgroups
+
 struct ggml_webgpu_back_pipeline_key {
     int  op;
     bool inplace;  // dst binding merged with src0
@@ -1227,8 +1241,8 @@ class ggml_webgpu_shader_lib {
     std::unordered_map<int, webgpu_pipeline> out_prod_pipelines;       // key is fixed, no variants yet
     std::unordered_map<ggml_webgpu_back_pipeline_key, webgpu_pipeline, ggml_webgpu_back_pipeline_key_hash>
                                              back_pipelines;           // op/inplace/overlap
-    std::unordered_map<int, webgpu_pipeline> repeat_back_pipelines;    // key is fixed, no variants yet
-    std::unordered_map<int, webgpu_pipeline> get_rows_back_pipelines;  // key is fixed, no variants yet
+    std::unordered_map<int, webgpu_pipeline> repeat_back_pipelines;    // key is TX of the REDUCE variant, 0 otherwise
+    std::unordered_map<int, webgpu_pipeline> get_rows_back_pipelines;  // key is 1 for the ZERO pass
     std::unordered_map<ggml_webgpu_row_norm_pipeline_key, webgpu_pipeline, ggml_webgpu_row_norm_pipeline_key_hash>
         row_norm_pipelines;                                            // op/inplace
 
@@ -1766,54 +1780,81 @@ class ggml_webgpu_shader_lib {
         return back_pipelines[key];
     }
 
-    webgpu_pipeline get_repeat_back_pipeline(const ggml_webgpu_shader_lib_context & context) {
-        auto it = repeat_back_pipelines.find(1);
+    // tx == 0 selects the thread-per-element variant, otherwise the REDUCE variant with TX = tx
+    webgpu_pipeline get_repeat_back_pipeline(const ggml_webgpu_shader_lib_context & context, uint32_t tx) {
+        const int key = (int) tx;
+
+        auto it = repeat_back_pipelines.find(key);
         if (it != repeat_back_pipelines.end()) {
             return it->second;
         }
 
         std::vector<std::string> defines;
-        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        std::string              variant = "repeat_back";
+        uint32_t                 wg_size = context.max_wg_size;
 
-        auto processed           = preprocessor.preprocess(wgsl_repeat_back, defines);
-        auto decisions           = std::make_shared<ggml_webgpu_generic_shader_decisions>();
-        decisions->wg_size       = context.max_wg_size;
-        webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, "repeat_back");
-        pipeline.context         = decisions;
-        repeat_back_pipelines[1] = pipeline;
-        return repeat_back_pipelines[1];
+        if (tx > 0) {
+            defines.push_back("REDUCE");
+            defines.push_back(std::string("TX=") + std::to_string(tx));
+            defines.push_back(std::string("TY=") + std::to_string(GGML_WEBGPU_REPEAT_BACK_WG_SIZE / tx));
+            wg_size = GGML_WEBGPU_REPEAT_BACK_WG_SIZE;
+            variant += "_reduce_tx" + std::to_string(tx);
+        }
+
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(wg_size));
+
+        auto processed             = preprocessor.preprocess(wgsl_repeat_back, defines);
+        auto decisions             = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size         = wg_size;
+        webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context           = decisions;
+        repeat_back_pipelines[key] = pipeline;
+        return repeat_back_pipelines[key];
     }
 
-    webgpu_pipeline get_get_rows_back_pipeline(const ggml_webgpu_shader_lib_context & context) {
-        auto it = get_rows_back_pipelines.find(1);
+    webgpu_pipeline get_get_rows_back_pipeline(const ggml_webgpu_shader_lib_context & context, bool zero) {
+        GGML_UNUSED(context);
+        const int key = zero ? 1 : 0;
+
+        auto it = get_rows_back_pipelines.find(key);
         if (it != get_rows_back_pipelines.end()) {
             return it->second;
         }
 
         std::vector<std::string> defines;
-        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        std::string              variant = "get_rows_back";
+        if (zero) {
+            defines.push_back("ZERO");
+            variant += "_zero";
+        }
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(GGML_WEBGPU_GET_ROWS_BACK_WG_SIZE));
 
-        auto processed             = preprocessor.preprocess(wgsl_get_rows_back, defines);
-        auto decisions             = std::make_shared<ggml_webgpu_generic_shader_decisions>();
-        decisions->wg_size         = context.max_wg_size;
-        webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, "get_rows_back");
-        pipeline.context           = decisions;
-        get_rows_back_pipelines[1] = pipeline;
-        return get_rows_back_pipelines[1];
+        auto processed               = preprocessor.preprocess(wgsl_get_rows_back, defines);
+        auto decisions               = std::make_shared<ggml_webgpu_generic_shader_decisions>();
+        decisions->wg_size           = GGML_WEBGPU_GET_ROWS_BACK_WG_SIZE;
+        webgpu_pipeline pipeline     = ggml_webgpu_create_pipeline(device, processed, variant);
+        pipeline.context             = decisions;
+        get_rows_back_pipelines[key] = pipeline;
+        return get_rows_back_pipelines[key];
     }
 
     webgpu_pipeline get_out_prod_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        GGML_UNUSED(context);
+
         auto it = out_prod_pipelines.find(1);
         if (it != out_prod_pipelines.end()) {
             return it->second;
         }
 
         std::vector<std::string> defines;
-        defines.push_back(std::string("WG_SIZE=") + std::to_string(context.max_wg_size));
+        defines.push_back(std::string("TM=") + std::to_string(GGML_WEBGPU_OUT_PROD_TM));
+        defines.push_back(std::string("TN=") + std::to_string(GGML_WEBGPU_OUT_PROD_TN));
+        defines.push_back(std::string("TK=") + std::to_string(GGML_WEBGPU_OUT_PROD_TK));
+        defines.push_back(std::string("WG_SIZE=") + std::to_string(GGML_WEBGPU_OUT_PROD_WG_SIZE));
 
         auto processed           = preprocessor.preprocess(wgsl_out_prod, defines);
         auto decisions           = std::make_shared<ggml_webgpu_generic_shader_decisions>();
-        decisions->wg_size       = context.max_wg_size;
+        decisions->wg_size       = GGML_WEBGPU_OUT_PROD_WG_SIZE;
         webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, processed, "out_prod");
         pipeline.context         = decisions;
         out_prod_pipelines[1]    = pipeline;

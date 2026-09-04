@@ -2962,7 +2962,21 @@ static webgpu_encoded_op ggml_webgpu_repeat_back(webgpu_context & ctx, ggml_tens
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
-    webgpu_pipeline pipeline  = ctx->shader_lib->get_repeat_back_pipeline(shader_lib_ctx);
+    // long reductions (norm weight gradients: a single dst row summed over all tokens) starve a
+    // thread-per-element kernel, so split the repeats across a workgroup instead. TX consecutive dst
+    // elements share a workgroup for coalescing; it shrinks when dst is too small to fill the GPU.
+    const uint32_t ne_dst = (uint32_t) ggml_nelements(dst);
+    const uint32_t n_rep  = (uint32_t) (ggml_nelements(src0) / ggml_nelements(dst));
+
+    uint32_t tx = 0;
+    if (n_rep >= GGML_WEBGPU_REPEAT_BACK_MIN_REP) {
+        tx = GGML_WEBGPU_REPEAT_BACK_TX_MAX;
+        while (tx > 1 && CEIL_DIV(ne_dst, tx) < GGML_WEBGPU_REPEAT_BACK_MIN_WG) {
+            tx /= 2;
+        }
+    }
+
+    webgpu_pipeline pipeline  = ctx->shader_lib->get_repeat_back_pipeline(shader_lib_ctx, tx);
     auto *          decisions = static_cast<ggml_webgpu_generic_shader_decisions *>(pipeline.context.get());
 
     std::vector<uint32_t> params = {
@@ -2986,8 +3000,11 @@ static webgpu_encoded_op ggml_webgpu_repeat_back(webgpu_context & ctx, ggml_tens
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0),
                                                   ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, dst) };
 
+    // REDUCE: a workgroup covers TX dst elements; default: a thread covers one
+    const uint32_t per_wg   = tx > 0 ? tx : decisions->wg_size;
+    uint32_t       total_wg = CEIL_DIV(ne_dst, per_wg);
+
     uint32_t wg_x, wg_y;
-    uint32_t total_wg = CEIL_DIV(ggml_nelements(dst), decisions->wg_size);
     compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
@@ -3002,8 +3019,11 @@ static webgpu_encoded_op ggml_webgpu_get_rows_back(webgpu_context & ctx,
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
-    webgpu_pipeline pipeline  = ctx->shader_lib->get_get_rows_back_pipeline(shader_lib_ctx);
-    auto *          decisions = static_cast<ggml_webgpu_generic_shader_decisions *>(pipeline.context.get());
+    // two passes: clear dst, then one workgroup per index scatters its grad row (the first
+    // occurrence of a row owns it and folds in the duplicates, so no f32 atomics are needed)
+    webgpu_pipeline zero_pipeline = ctx->shader_lib->get_get_rows_back_pipeline(shader_lib_ctx, true);
+    webgpu_pipeline pipeline      = ctx->shader_lib->get_get_rows_back_pipeline(shader_lib_ctx, false);
+    auto *          decisions     = static_cast<ggml_webgpu_generic_shader_decisions *>(pipeline.context.get());
 
     std::vector<uint32_t> params = {
         (uint32_t) ggml_nelements(dst),
@@ -3022,10 +3042,22 @@ static webgpu_encoded_op ggml_webgpu_get_rows_back(webgpu_context & ctx,
                                                   ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src1),
                                                   ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst) };
 
+    const uint32_t max_wg_per_dim = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension;
+
+    uint32_t zero_wg_x, zero_wg_y;
+    compute_2d_workgroups(CEIL_DIV(ggml_nelements(dst), decisions->wg_size), max_wg_per_dim, zero_wg_x, zero_wg_y);
+
+    // one workgroup per index
     uint32_t wg_x, wg_y;
-    uint32_t total_wg = CEIL_DIV(ggml_nelements(dst), decisions->wg_size);
-    compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
-    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
+    compute_2d_workgroups((uint32_t) src1->ne[0], max_wg_per_dim, wg_x, wg_y);
+
+    // the clear pass binds dst alone (unused bindings are dropped from the inferred layout)
+    std::vector<wgpu::BindGroupEntry> zero_entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, dst) };
+
+    return ggml_backend_webgpu_build_multi(ctx, {
+                                                    { zero_pipeline, params, zero_entries, { zero_wg_x, zero_wg_y } },
+                                                    { pipeline, params, entries, { wg_x, wg_y } },
+    });
 }
 
 static webgpu_encoded_op ggml_webgpu_out_prod(webgpu_context & ctx,
@@ -3038,8 +3070,12 @@ static webgpu_encoded_op ggml_webgpu_out_prod(webgpu_context & ctx,
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
 
-    webgpu_pipeline pipeline  = ctx->shader_lib->get_out_prod_pipeline(shader_lib_ctx);
-    auto *          decisions = static_cast<ggml_webgpu_generic_shader_decisions *>(pipeline.context.get());
+    webgpu_pipeline pipeline = ctx->shader_lib->get_out_prod_pipeline(shader_lib_ctx);
+
+    // TM x TN dst tiles per batch, flattened so consecutive workgroups walk tile_m first and share src1 tiles
+    const uint32_t n_tiles_m = CEIL_DIV((uint32_t) dst->ne[0], GGML_WEBGPU_OUT_PROD_TM);
+    const uint32_t n_tiles_n = CEIL_DIV((uint32_t) dst->ne[1], GGML_WEBGPU_OUT_PROD_TN);
+    const uint32_t n_wg      = n_tiles_m * n_tiles_n * (uint32_t) (dst->ne[2] * dst->ne[3]);
 
     std::vector<uint32_t> params = {
         (uint32_t) ggml_nelements(dst),
@@ -3067,6 +3103,9 @@ static webgpu_encoded_op ggml_webgpu_out_prod(webgpu_context & ctx,
         (uint32_t) (dst->nb[1] / ggml_type_size(dst->type)),
         (uint32_t) (dst->nb[2] / ggml_type_size(dst->type)),
         (uint32_t) (dst->nb[3] / ggml_type_size(dst->type)),
+        n_tiles_m,
+        n_tiles_n,
+        n_wg,
     };
 
     std::vector<wgpu::BindGroupEntry> entries = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0),
@@ -3074,8 +3113,7 @@ static webgpu_encoded_op ggml_webgpu_out_prod(webgpu_context & ctx,
                                                   ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dst) };
 
     uint32_t wg_x, wg_y;
-    uint32_t total_wg = CEIL_DIV(ggml_nelements(dst), decisions->wg_size);
-    compute_2d_workgroups(total_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
+    compute_2d_workgroups(n_wg, ctx->global_ctx->capabilities.limits.maxComputeWorkgroupsPerDimension, wg_x, wg_y);
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
