@@ -4868,7 +4868,16 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
-            supports_op = src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0);
+            {
+                const int n_src = op->op == GGML_OP_OPT_STEP_ADAMW ? 5 : 3;
+                supports_op = true;
+                for (int i = 0; i < n_src; ++i) {
+                    if (op->src[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[i])) {
+                        supports_op = false;
+                        break;
+                    }
+                }
+            }
             break;
         case GGML_OP_OUT_PROD:
             supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
@@ -4892,7 +4901,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_GET_ROWS_BACK:
             supports_op = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 &&
-                          ggml_is_contiguous(op);
+                          ggml_is_contiguous_rows(src0) && ggml_is_contiguous(op);
             break;
         default:
             break;
