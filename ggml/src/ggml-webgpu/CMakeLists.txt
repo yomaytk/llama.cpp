@@ -11,7 +11,7 @@ file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 message(STATUS "Shader output dir: ${SHADER_OUTPUT_DIR}")
 
 # Find all WGSL sources
-file(GLOB WGSL_SHADER_FILES
+file(GLOB WGSL_SHADER_FILES CONFIGURE_DEPENDS
     "${SHADER_DIR}/*.wgsl"
     "${SHADER_DIR}/*.tmpl"
 )
@@ -25,7 +25,7 @@ add_custom_command(
         ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/wgsl-shaders/embed_wgsl.py
             --input_dir "${SHADER_DIR}"
             --output_file "${SHADER_HEADER}"
-    DEPENDS ${WGSL_SHADER_FILES} ${CMAKE_CURRENT_SOURCE_DIR}/wgsl-shaders/embed_wgsl.py
+    DEPENDS ${WGSL_SHADER_FILES} ${SHADER_LIST_FILE} ${CMAKE_CURRENT_SOURCE_DIR}/wgsl-shaders/embed_wgsl.py
     VERBATIM
 )
 
