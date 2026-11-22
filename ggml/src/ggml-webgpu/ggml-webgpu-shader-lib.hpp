@@ -1297,6 +1297,10 @@ class ggml_webgpu_shader_lib {
                        webgpu_pipeline,
                        ggml_webgpu_gated_delta_net_pipeline_key_hash>
         gated_delta_net_pipelines;  // type/S_v/kda
+    std::unordered_map<ggml_webgpu_gated_delta_net_pipeline_key,
+                       webgpu_pipeline,
+                       ggml_webgpu_gated_delta_net_pipeline_key_hash>
+        gated_delta_net_replay_pipelines;  // type/S_v/kda
     std::unordered_map<ggml_webgpu_pad_pipeline_key, webgpu_pipeline, ggml_webgpu_pad_pipeline_key_hash>
         pad_pipelines;              // circular/non-circular
     std::unordered_map<ggml_webgpu_binary_pipeline_key, webgpu_pipeline, ggml_webgpu_binary_pipeline_key_hash>
@@ -2059,6 +2063,44 @@ class ggml_webgpu_shader_lib {
         webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, variant);
         gated_delta_net_pipelines[key] = pipeline;
         return gated_delta_net_pipelines[key];
+    }
+
+    // replay pass of the pending tokens, run before the REPLAY variant of get_gated_delta_net_pipeline
+    webgpu_pipeline get_gated_delta_net_replay_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        ggml_webgpu_gated_delta_net_pipeline_key key = {};
+        key.type                                     = context.dst->type;
+        key.s_v                                      = (int) context.src2->ne[0];
+        key.kda                                      = context.src3->ne[0] == context.src2->ne[0];
+        key.replay                                   = true;
+
+        auto it = gated_delta_net_replay_pipelines.find(key);
+        if (it != gated_delta_net_replay_pipelines.end()) {
+            return it->second;
+        }
+
+        std::vector<std::string> defines;
+        std::string              variant = "gated_delta_net_replay";
+
+        switch (key.type) {
+            case GGML_TYPE_F32:
+                variant += "_f32";
+                break;
+            default:
+                GGML_ABORT("Unsupported type for gated_delta_net_replay shader");
+        }
+
+        if (key.kda) {
+            defines.push_back("KDA");
+            variant += "_kda";
+        }
+
+        defines.push_back("S_V=" + std::to_string(key.s_v) + "u");
+        defines.push_back("WG_SIZE=" + std::to_string(key.s_v) + "u");
+
+        auto            processed             = preprocessor.preprocess(wgsl_gated_delta_net_replay, defines);
+        webgpu_pipeline pipeline              = ggml_webgpu_create_pipeline(device, processed, variant);
+        gated_delta_net_replay_pipelines[key] = pipeline;
+        return gated_delta_net_replay_pipelines[key];
     }
 
     webgpu_pipeline get_arange_pipeline(const ggml_webgpu_shader_lib_context & context) {

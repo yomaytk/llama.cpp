@@ -1529,11 +1529,6 @@ static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
-// storage buffers of the gated delta net shader: q, k, v, g, beta, state and dst, the fused cache, then the replay inputs
-static uint32_t ggml_webgpu_gated_delta_net_n_storage_buffers(const ggml_tensor * op, bool fused_cache) {
-    return 7 + (fused_cache ? 1 : 0) + (op->src[6] != nullptr ? 4 : 0);
-}
-
 static webgpu_encoded_op ggml_webgpu_gated_delta_net(webgpu_context & ctx,
                                                      ggml_tensor *    src0,
                                                      ggml_tensor *    src1,
@@ -1595,42 +1590,64 @@ static webgpu_encoded_op ggml_webgpu_gated_delta_net(webgpu_context & ctx,
         dst_fuse ? (uint32_t) (dst_fuse->nb[2] / ggml_type_size(dst_fuse->type)) : 0,
         dst_fuse ? (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst_fuse) / ggml_type_size(dst_fuse->type)) : 0,
 
-        pend_k ? (uint32_t) ggml_get_op_params_i32(dst, 1) : 0,
-        pend_k ? (uint32_t) ggml_get_op_params_i32(dst, 2) : 0,
-
-        pend_k ? (uint32_t) (pend_k->nb[1] / ggml_type_size(pend_k->type)) : 0,
-        pend_k ? (uint32_t) (pend_k->nb[2] / ggml_type_size(pend_k->type)) : 0,
-        pend_k ? (uint32_t) (pend_k->nb[3] / ggml_type_size(pend_k->type)) : 0,
-
-        pend_v ? (uint32_t) (pend_v->nb[1] / ggml_type_size(pend_v->type)) : 0,
-        pend_v ? (uint32_t) (pend_v->nb[2] / ggml_type_size(pend_v->type)) : 0,
-        pend_v ? (uint32_t) (pend_v->nb[3] / ggml_type_size(pend_v->type)) : 0,
-
-        pend_gb ? (uint32_t) (pend_gb->nb[1] / ggml_type_size(pend_gb->type)) : 0,
-        pend_gb ? (uint32_t) (pend_gb->nb[2] / ggml_type_size(pend_gb->type)) : 0,
-        pend_gb ? (uint32_t) (pend_gb->nb[3] / ggml_type_size(pend_gb->type)) : 0,
+        pend_k ? (uint32_t) ggml_get_op_params_i32(dst, 2) : 0,  // keep
     };
 
     std::vector<wgpu::BindGroupEntry> entries = {
         ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0), ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, src1),
         ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, src2), ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, src3),
-        ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, src4), ggml_webgpu_make_tensor_bind_group_entry(ctx, 5, src5),
-        ggml_webgpu_make_tensor_bind_group_entry(ctx, 6, dst),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, src4), ggml_webgpu_make_tensor_bind_group_entry(ctx, 5, dst),
     };
 
     if (dst_fuse) {
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 7, dst_fuse));
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, 6, dst_fuse));
     }
 
-    if (pend_k) {
-        const uint32_t binding = dst_fuse ? 8 : 7;
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, binding + 0, pend_k));
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, binding + 1, pend_v));
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, binding + 2, pend_gb));
-        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, binding + 3, n_rep));
+    if (!pend_k) {
+        entries.push_back(ggml_webgpu_make_tensor_bind_group_entry(ctx, entries.size(), src5));
+        return ggml_backend_webgpu_build(ctx, pipeline, params, entries, h, n_seqs);
     }
 
-    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, h, n_seqs);
+    // with the replay, a first pass runs the pending tokens from src5 and writes the state where the main pass starts
+    // from (the state tail of dst, or the fused cache view), so that each pass stays within 8 storage buffers
+    webgpu_pipeline replay_pipeline = ctx->shader_lib->get_gated_delta_net_replay_pipeline(shader_lib_ctx);
+
+    ggml_tensor * state_dst = dst_fuse ? dst_fuse : dst;
+
+    std::vector<uint32_t> replay_params = {
+        h,
+        (uint32_t) src0->ne[1],
+        dst_fuse ? (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst_fuse) / ggml_type_size(dst_fuse->type)) :
+                   s_v * h * n_tokens * n_seqs,
+        (uint32_t) ggml_get_op_params_i32(dst, 1),  // n_pend
+
+        (uint32_t) (pend_k->nb[1] / ggml_type_size(pend_k->type)),
+        (uint32_t) (pend_k->nb[2] / ggml_type_size(pend_k->type)),
+        (uint32_t) (pend_k->nb[3] / ggml_type_size(pend_k->type)),
+
+        (uint32_t) (pend_v->nb[1] / ggml_type_size(pend_v->type)),
+        (uint32_t) (pend_v->nb[2] / ggml_type_size(pend_v->type)),
+        (uint32_t) (pend_v->nb[3] / ggml_type_size(pend_v->type)),
+
+        (uint32_t) (pend_gb->nb[1] / ggml_type_size(pend_gb->type)),
+        (uint32_t) (pend_gb->nb[2] / ggml_type_size(pend_gb->type)),
+        (uint32_t) (pend_gb->nb[3] / ggml_type_size(pend_gb->type)),
+    };
+
+    std::vector<wgpu::BindGroupEntry> replay_entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src5),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, pend_k),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, pend_v),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, pend_gb),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, n_rep),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 5, state_dst),
+    };
+
+    return ggml_backend_webgpu_build_multi(ctx, {
+                                                    { replay_pipeline, std::move(replay_params),
+                                                     std::move(replay_entries), { h, n_seqs } },
+                                                    { pipeline, std::move(params), std::move(entries), { h, n_seqs } },
+    });
 }
 
 static std::optional<webgpu_encoded_op> ggml_webgpu_set_rows(webgpu_context & ctx,
@@ -3795,9 +3812,7 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode(webgpu_context ctx,
             return ggml_webgpu_ssm_scan(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6],
                                         node);
         case GGML_OP_GATED_DELTA_NET:
-            if (ggml_webgpu_gated_delta_net_n_storage_buffers(node, true) <=
-                    ctx->global_ctx->capabilities.limits.maxStorageBuffersPerShaderStage &&
-                ggml_webgpu_can_fuse_gdn_cache(cgraph, node_idx, num_encoded_ops)) {
+            if (ggml_webgpu_can_fuse_gdn_cache(cgraph, node_idx, num_encoded_ops)) {
                 ggml_tensor * dst_fuse = cgraph->nodes[node_idx + num_encoded_ops - 1]->src[1];
                 return ggml_webgpu_gated_delta_net(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5],
                                                    node, dst_fuse);
@@ -5342,9 +5357,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                               op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
                               s_v <= ctx->webgpu_global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup &&
-                              ggml_are_same_stride(src0, src1) &&
-                              ggml_webgpu_gated_delta_net_n_storage_buffers(op, false) <=
-                                  ctx->webgpu_global_ctx->capabilities.limits.maxStorageBuffersPerShaderStage;
+                              ggml_are_same_stride(src0, src1);
             }
             break;
         case GGML_OP_CLAMP:
